@@ -24,7 +24,7 @@ Usage:
                                                keys not named keep their color
   frame-keyboard style solid|split|rows [--keep-effect]
                                                per-key style from the frameshell theme
-  frame-keyboard highlight <key[=C]...> [-c C] [--base C] [--hold | --seconds N] [--skip-unknown]
+  frame-keyboard highlight <key[=C]...> [-c C] [--base C] [--hold | --seconds N | --stdin] [--skip-unknown]
                                                light keys live (RAM only, nothing saved), then stop
   frame-keyboard stop                          end a live frame, back to the saved effect
 
@@ -41,6 +41,7 @@ import datetime
 import json
 import os
 import re
+import select
 import signal
 import sys
 import time
@@ -831,25 +832,39 @@ def send_stop(dev):
     dev.write("live frame: stop", CMD_FRAME, b"\x00\x00\x00", index=2)
 
 
+def highlight_keys(items, lit, base, theme, layout, skip_unknown):
+    """Slot colors for `key` (in lit) and `key=color`; `color=C` and `base=C` set those two."""
+    colors = {}
+    for item in items:
+        key, _, color = item.partition("=")
+        if key == "color" and color:
+            lit = parse_color(color, theme)
+            continue
+        if key == "base" and color:
+            base = parse_color(color, theme)
+            continue
+        try:
+            slot = slot_of(key, layout)
+        except Fail:
+            # with --skip-unknown, names that are no key on the board (mouse binds, print …)
+            # are left out instead of failing
+            if skip_unknown:
+                continue
+            raise
+        colors[slot] = parse_color(color, theme) if color else lit
+    return colors, lit, base
+
+
 def cmd_highlight(a, dev):
     theme = theme_colors(a.theme)
     lit = parse_color(a.color or theme.get("primary", "white"), theme)
     base = parse_color(a.base or theme.get("bg", "off"), theme)
-    colors = {}
-    # "key" lights in the --color, "key=color" in its own; with --skip-unknown, names that are
-    # no key on the board (mouse binds, print …) are left out instead of failing
-    for item in a.keys:
-        key, _, color = item.partition("=")
-        try:
-            slot = slot_of(key, a.layout)
-        except Fail:
-            if a.skip_unknown:
-                continue
-            raise
-        colors[slot] = parse_color(color, theme) if color else lit
+    if not a.keys and not a.stdin:
+        raise Fail("highlight: name at least one key (or read them with --stdin)")
+    colors, lit, base = highlight_keys(a.keys, lit, base, theme, a.layout, a.skip_unknown)
     check_model(dev, a.force_model)
     block = frame_block(colors, base)
-    if not dev.live:
+    if not dev.live and not a.stdin:
         dev.write("live frame", CMD_FRAME, block, index=0)
         print("[dry-run] live, this frame goes out again every 0.5 s until the time is up or the "
               "process gets SIGTERM/SIGINT, then the stop packet:")
@@ -858,16 +873,38 @@ def cmd_highlight(a, dev):
     stop = []
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, lambda *_: stop.append(True))
-    until = None if a.hold else time.monotonic() + a.seconds
+    until = None if a.hold or a.stdin else time.monotonic() + a.seconds
     # A --hold whose starter is gone (the shell crashed) would light the keys for ever
     parent = os.getppid()
+
+    def over():
+        return bool(stop) or (until is not None and time.monotonic() >= until) or os.getppid() != parent
+
     try:
-        while not stop and (until is None or time.monotonic() < until) and os.getppid() == parent:
+        while not over():
+            # The board drops back to its effect about a second after the last frame
             dev.write("live frame", CMD_FRAME, block, index=0, delay=0.007)
-            for _ in range(10):
-                if stop or (until is not None and time.monotonic() >= until):
+            resend = time.monotonic() + 0.5
+            while not over() and time.monotonic() < resend:
+                if not a.stdin:
+                    time.sleep(0.05)
+                    continue
+                # --stdin: every line is a new key list (same words as on the command line),
+                # an empty line only the base color, end of input ends the frame
+                ready, _, _ = select.select([sys.stdin], [], [], 0.05)
+                if not ready:
+                    continue
+                line = sys.stdin.readline()
+                if line == "":
+                    stop.append(True)
                     break
-                time.sleep(0.05)
+                try:
+                    colors, lit, base = highlight_keys(line.split(), lit, base, theme, a.layout, a.skip_unknown)
+                except Fail as e:
+                    print(f"frame-keyboard: {e}", file=sys.stderr, flush=True)
+                    continue
+                block = frame_block(colors, base)
+                break  # the new frame goes out right away
     finally:
         send_stop(dev)
 
@@ -925,7 +962,9 @@ def main():
                            help="only store the colors unless self-define is the effect already")
         s.add_argument("-b", "--brightness", type=int, choices=range(10))
     s = sub.add_parser("highlight", parents=[common])
-    s.add_argument("keys", nargs="+", help="key or key=color")
+    s.add_argument("keys", nargs="*", help="key or key=color")
+    s.add_argument("--stdin", action="store_true",
+                   help="hold, and take new key lists from stdin, one per line (the shell's hotkey hints)")
     s.add_argument("-c", "--color")
     s.add_argument("--base")
     s.add_argument("--skip-unknown", action="store_true", help="leave out names that are no key on the board")

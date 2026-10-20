@@ -196,7 +196,9 @@ NAMED_COLORS = {"red": "ff0000", "green": "00ff00", "blue": "0000ff", "white": "
                 "off": "000000", "black": "000000", "yellow": "ffff00", "cyan": "00ffff",
                 "magenta": "ff00ff", "orange": "ff8000", "purple": "8000ff"}
 
-REPO = Path(__file__).resolve().parents[3]
+# The theme palettes live with the frame command (the cli repo); its link in ~/.local/bin
+# leads there
+CLI_DIR = Path(os.path.realpath(Path.home() / ".local/bin/frame")).parent
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "frameshell"
 BACKUP_DIR = STATE_DIR / "keyboard"
 
@@ -447,7 +449,7 @@ def theme_colors(name=None):
         except OSError:
             name = "periwinkle"
     try:
-        return json.loads((REPO / "themes" / f"{name}.json").read_text())["colors"]
+        return json.loads((CLI_DIR / "themes" / f"{name}.json").read_text())["colors"]
     except (OSError, KeyError, ValueError):
         return {}
 

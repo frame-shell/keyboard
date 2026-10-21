@@ -876,6 +876,10 @@ def cmd_highlight(a, dev):
     until = None if a.hold or a.stdin else time.monotonic() + a.seconds
     # A --hold whose starter is gone (the shell crashed) would light the keys for ever
     parent = os.getppid()
+    # --stdin is read straight from the descriptor: Python's buffered readline can take two
+    # lines at once and leave the second where select() no longer sees it
+    fd = sys.stdin.fileno()
+    pending = b""
 
     def over():
         return bool(stop) or (until is not None and time.monotonic() >= until) or os.getppid() != parent
@@ -891,13 +895,18 @@ def cmd_highlight(a, dev):
                     continue
                 # --stdin: every line is a new key list (same words as on the command line),
                 # an empty line only the base color, end of input ends the frame
-                ready, _, _ = select.select([sys.stdin], [], [], 0.05)
+                ready, _, _ = select.select([fd], [], [], 0.05)
                 if not ready:
                     continue
-                line = sys.stdin.readline()
-                if line == "":
+                data = os.read(fd, 4096)
+                if not data:
                     stop.append(True)
                     break
+                *lines, pending = (pending + data).split(b"\n")
+                if not lines:
+                    continue
+                # Only the newest list matters when several came at once
+                line = lines[-1].decode("utf-8", "replace")
                 try:
                     colors, lit, base = highlight_keys(line.split(), lit, base, theme, a.layout, a.skip_unknown)
                 except Fail as e:
